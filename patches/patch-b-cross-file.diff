@@ -1,0 +1,48 @@
+diff --git a/crates/mir-importer/src/translator/types.rs b/crates/mir-importer/src/translator/types.rs
+index 7482717..ea53879 100644
+--- a/crates/mir-importer/src/translator/types.rs
++++ b/crates/mir-importer/src/translator/types.rs
+@@ -169,6 +169,20 @@ fn translate_pointer_like(
+             let elem = translate_type(ctx, &elem_ty)?;
+             Ok(MirSliceType::get(ctx, elem).into())
+         }
++        // `&str` / `*const str` is layout-identical to `&[u8]` / `*const [u8]`
++        // (fat pointer = data ptr + length). The `str` pointees that show up
++        // in device-fn lowering all originate from `&'static str` panic
++        // messages and are never actually read; we just need a type the
++        // translator can name.
++        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Str) => {
++            let u8_ty = pliron::builtin::types::IntegerType::get(
++                ctx,
++                8,
++                pliron::builtin::types::Signedness::Unsigned,
++            )
++            .into();
++            Ok(MirSliceType::get(ctx, u8_ty).into())
++        }
+         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Adt(adt_def, substs))
+             if adt_def.trimmed_name() == "SharedArray" =>
+         {
+@@ -385,6 +399,22 @@ pub fn translate_type(
+             let elem = translate_type(ctx, &elem_ty)?;
+             Ok(MirSliceType::get(ctx, elem).into())
+         }
++        // `str` is layout-identical to `[u8]` (unsized; only appears through a
++        // wide pointer / reference). Treating it as `[u8]` lets `&str` panic-
++        // message globals reachable through cross-file device-fn helpers flow
++        // through type translation without aborting; the values are never
++        // dereferenced at runtime because the collector strips ::panicking::
++        // bodies, but their *types* still need a mapping for the surrounding
++        // code's MIR to translate.
++        rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::Str) => {
++            let u8_ty = pliron::builtin::types::IntegerType::get(
++                ctx,
++                8,
++                pliron::builtin::types::Signedness::Unsigned,
++            )
++            .into();
++            Ok(MirSliceType::get(ctx, u8_ty).into())
++        }
+         rustc_public::ty::TyKind::RigidTy(rustc_public::ty::RigidTy::RawPtr(ty, mutability)) => {
+             let is_mutable = mutability == Mutability::Mut;
+             translate_pointer_like(ctx, &ty, is_mutable)

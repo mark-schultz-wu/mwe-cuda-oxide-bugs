@@ -1,0 +1,5 @@
+# Mirrors cuda-oxide main's pin (crates/.../rust-toolchain.toml at SHA
+# c8b3103). Required by cargo-oxide's rustc-codegen-cuda driver.
+[toolchain]
+channel = "nightly-2026-04-03"
+components = ["rust-src", "rustc-dev", "rust-analyzer", "clippy"]

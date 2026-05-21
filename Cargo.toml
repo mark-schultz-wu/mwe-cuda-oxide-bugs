@@ -1,0 +1,6 @@
+# Top-level "umbrella" — intentionally excludes the bug crates so each can
+# carry its own toolchain pin / build flags without being pulled into a
+# shared lockfile. Each bug-* crate is its own standalone workspace.
+[workspace]
+members = []
+exclude = ["bug-a-tuple-return", "bug-b-cross-file"]

@@ -1,0 +1,13 @@
+[package]
+name = "bug-a-tuple-return"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Standalone — do not get pulled into the MWE umbrella workspace.
+[workspace]
+
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide", branch = "main" }
+cuda-host   = { git = "https://github.com/NVlabs/cuda-oxide", branch = "main" }
+cuda-core   = { git = "https://github.com/NVlabs/cuda-oxide", branch = "main" }

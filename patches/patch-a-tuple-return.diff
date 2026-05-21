@@ -1,0 +1,23 @@
+diff --git a/crates/mir-lower/src/convert/ops/call.rs b/crates/mir-lower/src/convert/ops/call.rs
+index 933b94a..6b3384c 100644
+--- a/crates/mir-lower/src/convert/ops/call.rs
++++ b/crates/mir-lower/src/convert/ops/call.rs
+@@ -367,8 +367,16 @@ pub fn convert(
+     };
+ 
+     let result_type = if let Some(mir_ty) = mir_result_ty_ptr {
+-        let is_unit = mir_ty.deref(ctx).is::<MirTupleType>();
+-        if is_unit {
++        // Only the *empty* tuple `()` is the unit type. A non-empty
++        // MirTupleType — e.g. `(u64, u64)` returned from a #[device]
++        // helper — must take the convert_type path and become an LLVM
++        // struct; coercing it to void here desyncs the call op's
++        // result arity from its uses and panics Operation::erase.
++        let is_unit_tuple = mir_ty
++            .deref(ctx)
++            .downcast_ref::<MirTupleType>()
++            .is_some_and(|t| t.get_types().is_empty());
++        if is_unit_tuple {
+             llvm_types::VoidType::get(ctx).into()
+         } else {
+             convert_type(ctx, mir_ty).map_err(anyhow_to_pliron)?
