@@ -15,8 +15,10 @@ mod helpers;
 use cuda_device::{DisjointSlice, kernel, thread};
 use cuda_host::cuda_module;
 
-// Compile-time switch. Build with INLINE_HELPER=false (default) to repro.
-const INLINE_HELPER: bool = false;
+// Read at compile time from env. Default: bug triggers.
+// Run `INLINE=1 cargo oxide build --arch sm_89` for the OK (inlined) variant.
+// build.rs declares rerun-if-env-changed=INLINE so no `cargo clean` is needed.
+const INLINE_HELPER: bool = option_env!("INLINE").is_some();
 
 #[cuda_module]
 mod kernels {

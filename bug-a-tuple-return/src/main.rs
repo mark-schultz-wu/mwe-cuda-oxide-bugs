@@ -12,7 +12,10 @@
 use cuda_device::{DisjointSlice, device, kernel, thread};
 use cuda_host::cuda_module;
 
-const USE_TUPLE: bool = true;
+// Read at compile time from env. Default: bug triggers.
+// Run `NO_TUPLE=1 cargo oxide build --arch sm_89` for the OK (array) variant.
+// build.rs declares rerun-if-env-changed=NO_TUPLE so no `cargo clean` is needed.
+const USE_TUPLE: bool = option_env!("NO_TUPLE").is_none();
 
 #[device]
 pub fn split_u128_tuple(x: u64) -> (u64, u64) {
