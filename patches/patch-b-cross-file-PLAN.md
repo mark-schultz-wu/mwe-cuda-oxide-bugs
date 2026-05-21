@@ -1,86 +1,111 @@
 # Patch B residual risk / open questions
 
-`patch-b-cross-file.diff` is a **candidate** fix, not a verified one.
-It adds a `RigidTy::Str → MirSliceType<u8>` arm to `translate_type` and
-`translate_pointer_like` in `crates/mir-importer/src/translator/types.rs`,
-on the theory that `&str` and `str` (the unsized pointee) are layout-
-identical to `&[u8]` and `[u8]`, so reusing the existing slice path is
-sound for translation purposes.
+`patch-b-cross-file.diff` is a **type-translation probe**, not a full
+fix. Runtime verification with both patches applied confirmed:
 
-## Why this may be sufficient
+- The patch *successfully* clears the original error
+  `Type translation not yet implemented for: RigidTy(Str)`.
+- It then surfaces a second-layer failure in `translate_constant`
+  (`crates/mir-importer/src/translator/rvalue.rs:2315`): no constant
+  handler exists for a `MirSliceType<u8>` constant whose backing
+  storage is a `&'static str` panic-message global.
 
-- The error fires in the importer's type translator
-  (`crates/mir-importer/src/translator/types.rs:706` → the catch-all
-  `Type translation not yet implemented for: {:?}` arm). Adding an
-  explicit `Str` arm short-circuits that.
-- The runtime layout match (fat pointer = data ptr + len) means
-  downstream `dialect-mir` operations that touch the slice metadata
-  (length comparisons, etc.) keep working without further changes.
-- The collector already filters `::panicking::` and `::fmt::` functions
-  (`crates/rustc-codegen-cuda/src/collector.rs:1053`), so the runtime
-  string-contents are never read; only the *types* need a mapping.
+Observed verbatim:
 
-## Why it may not be sufficient
+```
+Unsupported construct: Unsupported constant type in translate_constant.
 
-- The kernel-entry path apparently never reaches this code path for the
-  same `DisjointSlice::get_mut` bounds-check `&str`. That means either
-  (a) MIR-level optimization (DCE / `inline` MIR pass) strips the
-  `panic_bounds_check` call site before importer translation runs on
-  kernel-entry bodies, or (b) the kernel-entry path uses a different
-  importer entrypoint that doesn't hit this `translate_type` arm.
-  Without knowing which, the fix may simply move the failure deeper
-  (e.g. into `dialect-llvm` codegen of a now-translatable but
-  unsupported call).
-- `RigidTy::Str` may show up in additional positions the patch doesn't
-  cover — e.g. as a constant operand in an rvalue, or as part of a
-  larger ADT field. Each such site needs its own check.
-- The downstream PTX backend may not know how to materialize a
-  `MirSliceType<u8>` value containing a `&'static str` global address.
-  If so, the failure moves from translation-time to codegen-time.
+  Rust type : Ty { ... RigidTy(Ref(Region { kind: ReErased },
+              Ty { ... RigidTy(Str) }, Not)) }
+  pliron type: MirSliceType { element_ty: ... }
+  const repr : MirConst { kind: Allocated(Allocation { bytes: [...],
+               provenance: ProvenanceMap { ptrs: [(0, Prov(...))] },
+               align: 8, mutability: Mut }), ... }
 
-## What to verify, in order
+The type dispatch (ZST -> ptr_to_array -> struct -> enum -> float ->
+pointer -> integer) did not match this constant. A new handler may
+need to be added.
+```
 
-1. **Apply both patches, rebuild bug-b-cross-file.** If it still fails:
-   capture the new error and check whether it's earlier or later than
-   `RigidTy(Str)`. A later failure = patch landed correctly but
-   uncovers the next layer; an unchanged failure = the `Str` arm wasn't
-   actually exercised (different code path).
-2. **Diff the kernel-entry and device-fn importer entrypoints.** Find
-   the call sites that drive translation for each:
-   - Kernel-entry: `crates/rustc-codegen-cuda/src/device_codegen.rs`
-     and `crates/mir-lower/src/lowering.rs` (`is_kernel = true` branch).
-   - Device-fn: same files, `is_kernel = false` branch.
-   The split likely lives in `device_codegen.rs:298` (the
-   `if func.is_kernel { "kernel" } else { "device" }` site, line found
-   via grep). Trace each branch through to where `translate_type` is
-   ultimately called, and identify which MIR optimizations run between.
-3. **Check whether `optimized_mir` vs `mir_for_ctfe` is the source.**
-   If the kernel-entry path reads `optimized_mir` (which has DCE) and
-   the device-fn path reads pre-optimization MIR, switching the
-   device-fn path to `optimized_mir` may strip the panic branches
-   uniformly.
-4. **If (2) shows the device-fn path skips a MIR pass the kernel-entry
-   path runs (e.g. `inline` or `simplify_cfg`),** the structural fix is
-   to run those passes on device-fn bodies too, not to keep adding
-   one-off type arms.
+So `Str -> MirSliceType<u8>` is sound at the *type* level but the
+constant-translation pipeline doesn't know how to materialize a
+fat-pointer slice constant.
+
+## Two follow-up directions
+
+### A. Surgical — add a slice/string-constant handler
+
+Add an arm to `translate_constant_value_from_bytes` (and the
+top-level `translate_constant` dispatch above it) that, when the
+target pliron type is `MirSliceType`, emits an aggregate of:
+
+- the data-pointer constant pointing into the allocation referenced
+  by the rust `Allocation` (the first 8 bytes carry the
+  provenance-backed offset), and
+- the length constant (the next 8 bytes, read as integer).
+
+Concretely, the constant's `Allocation.bytes` already contains both
+halves of the fat pointer in the expected slot layout (8B ptr + 8B
+len for a 64-bit target). The handler reads them out, builds a
+`MirConstantOp` for the integer length, references the pointee
+allocation for the data pointer, and wraps both in whatever
+aggregate-constant form `MirSliceType` accepts.
+
+Effort: ~half-day if MirSliceType already has a constant-builder
+helper; ~1 day if it has to be added.
+
+### B. Structural — DCE before translation on device-fn bodies
+
+The kernel-entry path doesn't crash on the same `DisjointSlice::get_mut`
+panic branches, so something upstream prunes them. Likely candidates:
+
+- The kernel-entry path reads `optimized_mir` (which runs the standard
+  cleanup MIR opts), the device-fn path reads pre-optimization MIR.
+- The kernel-entry path runs an explicit `simplify_branches` /
+  `simplify_cfg` pass before translation, the device-fn path doesn't.
+
+If we can identify the asymmetry and route device-fn bodies through
+the same pre-translation MIR pipeline, both the original
+`RigidTy(Str)` failure and the next-layer
+`Unsupported constant type` failure go away together, because the
+panic-message `&str` constants are never reached.
+
+Investigation steps:
+
+1. Diff the kernel-entry and device-fn entrypoints into the importer.
+   Start at `crates/rustc-codegen-cuda/src/device_codegen.rs:298`
+   (`if func.is_kernel { "kernel" } else { "device" }`).
+2. Walk each branch through `crates/mir-importer/src/pipeline.rs`
+   (the `run_pipeline` / `lower_to_llvm` entrypoints) and identify
+   where MIR is fetched and which passes run.
+3. If the kernel-entry path uses `optimized_mir` and the device-fn
+   path uses raw MIR, switching the device-fn path to
+   `optimized_mir` (or running the same subset of passes) is the
+   fix. Fallout to expect: any device-fn semantics that relied on
+   unoptimized MIR (probably none, but worth a regression sweep
+   against `crates/rustc-codegen-cuda/examples/`).
+
+Effort: 1-2 days, plus the regression sweep.
 
 ## Recommendation
 
-Land Patch A (clean and isolated). Apply the Patch B candidate as a
-*probe*, not a fix: it costs nothing to leave the `Str` arm in (the
-mapping is semantically correct), and it converts an "unknown
-unknown" into a "known next failure point" that can be debugged
-incrementally. The real fix is almost certainly making the device-fn
-import path run the same DCE that the kernel-entry path benefits
-from — Patch B's diff just lets us see past the first crash.
+Land Patch A immediately (verified, isolated, low risk).
 
-## Effort estimate for the structural fix
+For Patch B: keep the current type-translation arm as a stepping
+stone, then take direction **B** (structural DCE) as the real fix.
+Direction A (slice-constant handler) is a defensible local fix but
+treats the symptom -- the panic-message constants exist in MIR only
+because the panic branches weren't pruned earlier, and direction B
+removes the root cause.
 
-- ~1 day to instrument both lowering paths and produce a side-by-side
-  diff of MIR pass ordering.
-- ~1–2 days to unify the paths (or move device-fn import to read
-  `optimized_mir`) and shake out the resulting fallout in
-  `crates/rustc-codegen-cuda/examples/`.
-- Regression coverage: add a `cross_file_device_fn` example mirroring
-  the bug-b MWE; place it in `crates/rustc-codegen-cuda/examples/`
-  next to `helper_fn/`.
+If direction B turns out to be expensive (e.g., the device-fn path
+uses raw MIR for a load-bearing reason), fall back to direction A.
+
+## Regression coverage
+
+Add `crates/rustc-codegen-cuda/examples/cross_file_device_fn/` once
+direction B lands -- mirror this MWE's bug-b layout (helper in a
+sibling file, kernel just calls it). After A+B together, this should
+build cleanly. Keep `error_cross_file_device_fn/` capturing the
+*pre-fix* state as a regression marker if cuda-oxide's example
+harness supports both.
